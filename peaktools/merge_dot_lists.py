@@ -38,7 +38,6 @@ def read_validate_dots_list(dots_path):
     except KeyError as exc_one:
         print("Seems like {} is not in cooltools format or lacks some columns ...".format(dots_path))
         raise exc_one
-
     # returning the subset:
     return dots_must
 
@@ -48,23 +47,30 @@ def read_validate_dots_list(dots_path):
 
 @cli.command()
 @click.argument(
-    "dots_path_5kb",
-    metavar="DOTS_PATH_5kb",
+    "dots_paths",
+    metavar="DOTS_PATHS",
     type=click.Path(exists=True, dir_okay=False),
-    nargs=1)
-@click.argument(
-    "dots_path_10kb",
-    metavar="DOTS_PATH_10kb",
-    type=click.Path(exists=True, dir_okay=False),
+    nargs=-1)
+@click.option(
+    "--resolutions",
+    metavar="RESOLUTIONS",
+    help="Allow multiple resolutions, but we are actually expecting 5,"
+          "10 and 25 kb resolutions.",
+    type=str,
     nargs=1)
 # options ...
 @click.option(
-    '--radius', 
+    '--radius',
     help='Radius for clustering, i.e., to consider'
          'a couple of dots "identical", typically ~20kb.',
     type=int,
     default=20000,
     show_default=True)
+@click.option(
+    "--HICCUPS_filter", "-f",
+    help="Enable HICCUPS-filtering of lowest resolution calls",
+    is_flag=True,
+    default=False)
 @click.option(
     "--verbose", "-v",
     help="Enable verbose output",
@@ -94,38 +100,42 @@ def read_validate_dots_list(dots_path):
 
 
 
-def merge_dot_lists(dots_path_5kb,
-                    dots_path_10kb,
+def merge_dot_lists(dots_paths,
+                    resolutions,
                     radius,
+                    hiccups_filter,
                     verbose,
                     output,
                     bin1_id_name,
                     bin2_id_name):
-
-
+    resolutions = [int(res) for res in resolutions.split(',')]
+    if len(dots_paths) != len(resolutions):
+        raise ValueError("Number of dot file paths should match the number of resolutions")
+    order = np.argsort(resolutions)
+    resolutions = np.asarray(resolutions)[order]
     # load dots lists ...
-    dots_5kb  = read_validate_dots_list(dots_path_5kb)
-    dots_10kb = read_validate_dots_list(dots_path_10kb)
+    dots  = [read_validate_dots_list(dots_path) for dots_path in dots_paths]
+    dots = [dots[i] for i in order]
 
     if verbose:
         # before merging:
         print("Before merging:")
-        print("number of dots_5kb: {}".format(len(dots_5kb)))
-        print("number of dots_10kb: {}".format(len(dots_10kb)))
+        for i, d in enumerate(dots):
+            print("number of dots in {}: {}".format(dots_paths[i], len(d)))
         print("")
 
 
     # add some sort of cross-validation later on:
 
     # add label to each DataFrame:
-    dots_5kb["res"] = "5kb"
-    dots_10kb["res"] = "10kb"
+    for d,r in zip(dots, resolutions):
+        d['res'] = r
 
     # extract a list of chroms:
-    chroms = list(dots_5kb['chrom1'].drop_duplicates())
+    chroms = list(dots[0]['chrom1'].drop_duplicates())
 
     # merge 2 DataFrames and sort (why sorting ?! just in case):
-    dots_merged = pd.concat([dots_5kb,dots_10kb],
+    dots_merged = pd.concat(dots,
                             ignore_index=True).sort_values(by=["chrom1",bin1_id_name,"chrom2",bin2_id_name])
 
     # l10dat[["chrom1","start1","end1","chrom2","start2","end2"]].copy()
@@ -162,7 +172,7 @@ def merge_dot_lists(dots_path_5kb,
 
     # next thing we should do is to remove
     # redundant peaks called at 10kb, that were
-    # also called at 5kb (5kb being a priority) ... 
+    # also called at 5kb (5kb being a priority) ...
 
     # there will be groups (clusters) with > 2 pixels
     # i.e. several 5kb and 10kb pixels combined
@@ -172,70 +182,79 @@ def merge_dot_lists(dots_path_5kb,
 
     # introduce unqie label per merged cluster, just in case:
     dots_merged["c_label_merge"] = dots_merged["chrom1"]+"_"+dots_merged["c_label_merge"].astype(np.str)
-
-    # now let's just follow HiCCUPs filtering process:
-    all_5kb_peaks = dots_merged[dots_merged["res"] == "5kb"]
-    unique_5kb_peaks = all_5kb_peaks[all_5kb_peaks["c_size_merge"] == 1]
-    all_10kb_peaks = dots_merged[dots_merged["res"] == "10kb"]
-    # 1. extract only reproducible 5kb peaks :
-    reproducible_5kb_peaks = all_5kb_peaks[ all_5kb_peaks["c_size_merge"]>1 ]
-    # 2. extract unique 10Kb peaks :
-    unique_10kb_peaks = all_10kb_peaks[ all_10kb_peaks["c_size_merge"]==1 ]
-    # 3. extract unique 5kb peaks close to diagonal :
-    diagonal_distance_5kb_peak = np.abs(unique_5kb_peaks[bin1_id_name] - unique_5kb_peaks[bin2_id_name])
-    unique_5kb_peaks_around_diagonal = unique_5kb_peaks[ diagonal_distance_5kb_peak < 110000 ]
-    # 4. extract unique 5kb peaks that appear particularly strong :
-    strength_5kb_peak = unique_5kb_peaks["obs.raw"]
-    unique_5kb_peaks_strong = unique_5kb_peaks[ strength_5kb_peak > 100 ]
-
-
-    if verbose:
-        # describe each category:
-        print("number of reproducible_5kb_peaks: {}".format(len(reproducible_5kb_peaks)))
-        print("number of unique_10kb_peaks: {}".format(len(unique_10kb_peaks)))
-        print("number of unique_5kb_peaks_around_diagonal: {}".format(len(unique_5kb_peaks_around_diagonal)))
-        print("number of unique_5kb_peaks_strong: {}".format(len(unique_5kb_peaks_strong)))
-        print()
-
-
-
-    # now concatenate these lists ...
-    dfs_to_concat = [reproducible_5kb_peaks,
-                     unique_10kb_peaks,
-                     unique_5kb_peaks_around_diagonal,
-                     unique_5kb_peaks_strong]
-
-    dots_merged_filtered = pd.concat(dfs_to_concat).sort_values(by=["chrom1",bin1_id_name,"chrom2",bin2_id_name])
-    # dedup is required as overlap is unavoidable ...
-    dots_merged_filtered = dots_merged_filtered.drop_duplicates(subset=["chrom1",bin1_id_name,"chrom2",bin2_id_name])
-
     if verbose:
         # final number:
-        print("number of pixels after the merge: {}".format(len(dots_merged_filtered)))
+        print("Total number of pixels in input before deduping: {}".format(len(dots_merged)))
         print()
+    # now let's just follow HiCCUPs filtering process:
+    if hiccups_filter:
+        all_peaks = []
+        unique_peaks = []
+        reproducible_peaks = []
+        unique_peaks_around_diag = []
+        unique_peaks_strong = []
+        for res in resolutions:
+            all_res = dots_merged[dots_merged["res"] == res]
+            all_peaks.append(all_res)
+            unique_peaks.append(all_res[all_res["c_size_merge"] == 1])
+            reproducible_peaks.append(all_res[all_res["c_size_merge"]>1 ])
+            diagonal_distance = np.abs(unique_peaks[-1][bin1_id_name] - unique_peaks[-1][bin2_id_name])
+            unique_peaks_around_diag.append(unique_peaks[-1][diagonal_distance < 220*res]) #Scale with resolution?
+            strength_res = unique_peaks[-1]["obs.raw"]
+            unique_peaks_strong.append(unique_peaks[-1][strength_res > 100])
+
+            if verbose:
+                # describe each category:
+                print("number of reproducible_{}_peaks: {}".format(res, len(reproducible_peaks[-1])))
+                print("number of unique_{}_peaks: {}".format(res, len(unique_peaks[-1])))
+                print("number of unique_{}_peaks_around_diagonal: {}".format(res, len(unique_peaks_around_diag[-1])))
+                print("number of unique_{}_peaks_strong: {}".format(res, len(unique_peaks_strong[-1])))
+                print()
+
+    # now concatenate these lists ...
+        dfs_to_concat = [reproducible_peaks[0],
+                         *unique_peaks[1:],
+                         unique_peaks_around_diag[0],
+                         unique_peaks_strong[0]]
+
+        dots_merged_filtered = pd.concat(dfs_to_concat).sort_values(by=["chrom1",bin1_id_name,"chrom2",bin2_id_name])
+        # dedup is required as overlap is unavoidable ...
+        dots_merged_filtered = dots_merged_filtered.drop_duplicates(subset=["chrom1",'c_label'])
+
+        if verbose:
+            # final number:
+            print("number of pixels after the merge: {}".format(len(dots_merged_filtered)))
+            print()
 
 
     ##############################
     # OUTPUT:
     ##############################
-    if output is not None:
-        dots_merged_filtered[must_columns].to_csv(
-                                        output,
-                                        sep='\t',
-                                        header=True,
-                                        index=False,
-                                        compression=None)
+        if output is not None:
+            dots_merged_filtered[must_columns].to_csv(
+                                            output,
+                                            sep='\t',
+                                            header=True,
+                                            index=False,
+                                            compression=None)
+        return dots_merged_filtered
+    else:
+        dots_merged = dots_merged.drop_duplicates(['chrom1', 'c_label'])
+        if output is not None:
+            dots_merged[must_columns].to_csv(output,
+                                             sep='\t',
+                                             header=True,
+                                             index=False,
+                                             compression=None)
+    if verbose:
+        print("Total number of loops after deduping: {}".format(len(dots_merged)))
 
     #  return just in case ...
-    return dots_merged_filtered
+    return dots_merged
 
 
-
-
-
-
-# if __name__ == '__main__':
-#     merge_dot_lists()
+#if __name__ == '__main__':
+#    merge_dot_lists()
 
 
 
